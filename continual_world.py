@@ -9,6 +9,7 @@ from jaxrl import wrappers
 
 from jaxrl.wrappers.normalization import RescaleReward
 
+
 def get_mt50() -> metaworld.MT50:
     saved_random_state = np.random.get_state()
     np.random.seed(999)
@@ -16,6 +17,7 @@ def get_mt50() -> metaworld.MT50:
     MT50 = metaworld.MT50()
     np.random.set_state(saved_random_state)
     return MT50
+
 
 TASK_SEQS = {
     "cw10": [
@@ -93,8 +95,40 @@ TASK_SEQS = {
 }
 
 TASK_SEQS["cw20"] = TASK_SEQS["cw10"] + TASK_SEQS["cw10"]
+
+
+def get_benchmark_description_corpus() -> List[str]:
+    """Return unique benchmark-provided textual descriptions for SOM pretraining.
+
+    This corpus is used only to construct a semantic topology for subnetwork
+    allocation. It does not contain trajectories, rewards, demonstrations,
+    replay buffers, learned policies, gradients, or environment interaction data.
+    """
+    task_to_hint = {}
+    for seq in TASK_SEQS.values():
+        for item in seq:
+            if isinstance(item, dict) and "task" in item and "hint" in item:
+                task_to_hint[item["task"]] = item["hint"]
+
+    descriptions = []
+    seen = set()
+    for seq in TASK_SEQS.values():
+        for item in seq:
+            if isinstance(item, dict):
+                text = item.get("hint") or item.get("task")
+            else:
+                text = task_to_hint.get(item, str(item))
+            if text and text not in seen:
+                descriptions.append(text)
+                seen.add(text)
+    return descriptions
+
+
+SOM_PRETRAIN_DESCRIPTION_CORPUS = get_benchmark_description_corpus()
+
 META_WORLD_TIME_HORIZON = 200
 MT50 = get_mt50()
+
 
 class RandomizationWrapper(gym.Wrapper):
     """Manages randomization settings in MetaWorld environments."""
@@ -142,7 +176,7 @@ def get_subtasks(name: str) -> List[metaworld.Task]:
 
 
 def get_single_env(
-    name, seed, 
+    name, seed,
     randomization="random_init_all",
     add_episode_monitor=True,
     normalize_reward=False

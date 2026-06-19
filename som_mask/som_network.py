@@ -1,16 +1,32 @@
 import numpy as np
-import jax.numpy as jnp
 from minisom import MiniSom
 from typing import Tuple
 
+
 class SOMNetwork:
+    """Layer-wise SOM allocator for semantic subnetwork masks.
+
+    The SOM is trained only on task-description embeddings. It does not consume
+    trajectories, rewards, replay buffers, expert demonstrations, policy weights,
+    or any environment-interaction data.
+
+    Mask generation is deterministic after SOM pretraining:
+      1. compute the distance map between a task embedding and all SOM units;
+      2. activate the Top-K closest SOM units;
+      3. flatten the binary SOM-unit activation map;
+      4. repeat/trim it to the target hidden-layer width.
+
+    This implementation therefore uses a fixed Top-K-and-tiling mapping from SOM
+    units to neurons, not a learned propagation matrix.
+    """
+
     def __init__(
         self,
         input_dim: int,
-        som_size: Tuple[int, int] = (32, 32),
+        som_size: Tuple[int, int] = (8, 8),
         sigma: float = 1.0,
         learning_rate: float = 0.5,
-        random_seed: int = 42
+        random_seed: int = 42,
     ):
         self.som_x, self.som_y = som_size
         self.input_dim = input_dim
@@ -20,44 +36,64 @@ class SOMNetwork:
             input_len=input_dim,
             sigma=sigma,
             learning_rate=learning_rate,
-            random_seed=random_seed
+            random_seed=random_seed,
         )
         self._is_trained = False
-    
+
+    @property
+    def num_units(self) -> int:
+        return self.som_x * self.som_y
 
     def train(self, data: np.ndarray, num_iterations: int = 100):
+        """Train the SOM from semantic task-description embeddings."""
         self.som.random_weights_init(data)
         self.som.train_random(data, num_iterations)
         self._is_trained = True
-        print(f"✅ SOM trained on {len(data)} samples for {num_iterations} iterations.")
+        print(f"✅ SOM trained on {len(data)} text-description embeddings for {num_iterations} iterations.")
 
     def get_bmu(self, e_k: np.ndarray) -> Tuple[int, int]:
         if not self._is_trained:
             raise ValueError("SOM must be trained before calling get_bmu.")
         return self.som.winner(e_k)
-    
-    
-    def get_mask(self,e_k: np.ndarray,k:int,mask_dim:int):
-        #获取e_k和权重的欧几里得距离
-        distances = self.som.activate(e_k)
-        #获取距离矩阵的排序下标并拉直距离矩阵
-        sortDistance = distances.argsort(axis=None) #直接把som竞争层 folteen拉直
-        #获取前k个小距离下标
-        top_k_index = sortDistance[:k]
-        #转换得到掩码向量应该和隐藏层一样大
-        mask = np.zeros_like(sortDistance,dtype='float')
-        # print(f"get_mask:mask.shape:{mask.shape}")
-        for index in top_k_index:
-            mask[index] = 1
-        rep = 0
-        old_mask_dim = mask.shape[0]#(一定要old_mask_dim小于mask——dim才行)
-        while old_mask_dim * rep != mask_dim:
-            rep += 1
-        mask = np.tile(mask, rep)
-        # print(f"get_mask:new_mask.shape:{mask.shape}")
-        return mask
 
-        
+    def get_topk_unit_mask(self, e_k: np.ndarray, k: int) -> np.ndarray:
+        """Return a flattened binary mask over SOM units.
+
+        Args:
+            e_k: Task-description embedding.
+            k: Number of nearest SOM units to activate.
+
+        Returns:
+            A vector of shape ``(som_x * som_y,)`` with Top-K units set to 1.
+        """
+        if not self._is_trained:
+            raise ValueError("SOM must be trained before calling get_topk_unit_mask.")
+        if k <= 0:
+            raise ValueError("top-k must be positive.")
+        if k > self.num_units:
+            raise ValueError(f"top-k={k} exceeds the number of SOM units ({self.num_units}).")
+
+        distances = self.som.activate(e_k)
+        top_k_indices = np.argsort(distances, axis=None)[:k]
+        unit_mask = np.zeros(self.num_units, dtype=np.float32)
+        unit_mask[top_k_indices] = 1.0
+        return unit_mask
+
+    def unit_mask_to_neuron_mask(self, unit_mask: np.ndarray, mask_dim: int) -> np.ndarray:
+        """Map flattened SOM-unit activations to a neuron-level mask.
+
+        The mapping is fixed and deterministic: the SOM-unit mask is repeated and
+        then trimmed to ``mask_dim``. This avoids an implicit or underspecified
+        learned/random propagation matrix.
+        """
+        if mask_dim <= 0:
+            raise ValueError("mask_dim must be positive.")
+        repeats = int(np.ceil(mask_dim / unit_mask.shape[0]))
+        return np.tile(unit_mask, repeats)[:mask_dim].astype(np.float32)
+
+    def get_mask(self, e_k: np.ndarray, k: int, mask_dim: int):
+        unit_mask = self.get_topk_unit_mask(e_k, k)
+        return self.unit_mask_to_neuron_mask(unit_mask, mask_dim)
 
     def reinforce(self, e_k: np.ndarray, eta: float = 0.1):
         num_iterations = 100
